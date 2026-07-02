@@ -17,5 +17,5 @@ A modern, immutable date utility library, powered by date-fns for reliability an
 ## 本地 API
 | 符号 | 文档 |
 | --- | --- |
-| `DATE_FORMAT` | [DATE_FORMAT](https://esdora.js.org/packages/date/reference/constant/date-format) |
-| `analyzeTimeRange` | [analyzeTimeRange](https://esdora.js.org/packages/date/reference/convenience/analyze-time-range) |
+| `DATE_FORMAT` | 见文档站 |
+| `analyzeTimeRange` | 见文档站 |
