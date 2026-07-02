@@ -5,12 +5,15 @@ import { beforeAll, describe, expect, it } from 'vitest'
 import {
   analyzeAll,
   buildDocsFileset,
+  countLocalValueDeclarations,
   deriveDocUrl,
   deriveOverviewUrl,
   detectConflicts,
+  detectMultiValueExports,
   isExternalSourceLabel,
   packageNameOf,
   renderLlmsMarkdown,
+  resolveDefinitionFile,
   toKebab,
 } from './analyze-package-exports.mjs'
 
@@ -335,6 +338,12 @@ describe('toKebab — 命名风格转换', () => {
     expect(toKebab('cn')).toBe('cn')
     expect(toKebab('clamp')).toBe('clamp')
   })
+
+  it('下划线前缀的全大写常量剥离下划线后转换（如 _JSON → json）', () => {
+    // kit 包 _JSON 符号经 kebab 后需匹配文档页 json.md（不带前导下划线）
+    expect(toKebab('_JSON')).toBe('json')
+    expect(toKebab('_ID')).toBe('id')
+  })
 })
 
 describe('isExternalSourceLabel — 来源标签判定', () => {
@@ -631,5 +640,89 @@ describe('renderLlmsMarkdown — 输出结构', () => {
     })
     // entry './atom-css' → import from '@esdora/biz/atom-css'
     expect(md).toContain('import { ... } from \'@esdora/biz/atom-css\'')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// Phase 4 —— named re-export 溯源（llms.md 链接回归 bug 修复）+
+//            「一文件一公共值导出」强制检查
+//
+// resolveDefinitionFile：验证沿 named re-export 链追溯到符号定义文件。
+// detectMultiValueExports / countLocalValueDeclarations：验证叶子实现文件
+// 的多公共值导出违规检测，以及 barrel/类型/重载等豁免路径。
+// ---------------------------------------------------------------------------
+
+describe('resolveDefinitionFile — named re-export 链溯源', () => {
+  it('起始文件直接声明符号时返回自身', () => {
+    // safe 的定义文件就是 safe.ts 本身
+    const defFile = resolveDefinitionFile(
+      'randomColor',
+      join(REPO_ROOT, 'packages/color/src/generation/random-color/index.ts'),
+    )
+    expect(defFile).toBe(join(REPO_ROOT, 'packages/color/src/generation/random-color/index.ts'))
+  })
+
+  it('沿 named re-export 链追溯到定义文件（多层 barrel）', () => {
+    // kit 根 barrel: export { safe } from './function'
+    // function barrel: export { safe } from './safe'
+    // safe barrel: export { safe } from './safe'
+    // safe.ts: 定义 safe
+    // 起点设为 kit 根 barrel，应追溯到 .../function/safe/safe.ts
+    const kitRoot = join(REPO_ROOT, 'packages/kit/src/index.ts')
+    const defFile = resolveDefinitionFile('safe', kitRoot)
+    expect(defFile).toBe(join(REPO_ROOT, 'packages/kit/src/function/safe/safe.ts'))
+  })
+
+  it('溯源到定义文件后，deriveDocUrl 能得到含分类前缀的正确路径', () => {
+    // 这是回归 bug 的核心断言：修复前 originFile 停在 barrel，推导出
+    // reference/safe（缺 function/）；修复后经溯源得到 reference/function/safe
+    const kitRoot = join(REPO_ROOT, 'packages/kit/src/index.ts')
+    const defFile = resolveDefinitionFile('safe', kitRoot)
+    const fileset = new Set(['packages/kit/reference/function/safe'])
+    expect(deriveDocUrl('safe', defFile, 'kit', fileset))
+      .toBe('packages/kit/reference/function/safe')
+  })
+})
+
+describe('countLocalValueDeclarations — 值符号统计', () => {
+  it('单函数文件计为 1（合规）', () => {
+    const file = join(REPO_ROOT, 'packages/kit/src/function/safe/safe.ts')
+    const { count, names } = countLocalValueDeclarations(file)
+    expect(count).toBe(1)
+    expect(names).toEqual(['safe'])
+  })
+
+  it('函数 + 伴生类型文件计为 1（类型不计入值符号）', () => {
+    // randomColor + RandomColorOptions(interface) → 只计 randomColor
+    const file = join(REPO_ROOT, 'packages/color/src/generation/random-color/index.ts')
+    const { count, names } = countLocalValueDeclarations(file)
+    expect(count).toBe(1)
+    expect(names).toEqual(['randomColor'])
+  })
+
+  it('函数重载合并为 1 个值符号', () => {
+    // is-circular 有多个 export function isCircular 签名 → 合并为 1
+    const file = join(REPO_ROOT, 'packages/kit/src/is/is-circular/index.ts')
+    const { count, names } = countLocalValueDeclarations(file)
+    expect(count).toBe(1)
+    expect(names).toEqual(['isCircular'])
+  })
+})
+
+describe('detectMultiValueExports — 全仓叶子文件违规检测', () => {
+  // 用真实仓库做集成测试：拆分完成后应无违规。
+  // 这同时验证了 barrel（is/index.ts、function/index.ts）、纯类型文件（types.ts）、
+  // _internal/、experimental/、重载等豁免路径都被正确跳过。
+  let violations
+  beforeAll(() => {
+    violations = detectMultiValueExports(analyzeAll())
+  })
+
+  it('拆分完成后全仓无多公共值导出违规', () => {
+    if (violations.length > 0) {
+      // 打印违规细节便于定位
+      console.error('多导出违规:', JSON.stringify(violations, null, 2))
+    }
+    expect(violations).toHaveLength(0)
   })
 })

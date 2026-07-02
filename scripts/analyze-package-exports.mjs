@@ -390,6 +390,137 @@ function detectConflicts(surface) {
   return conflicts
 }
 
+// ----------------------------------------------------------------------------
+// 「一文件一公共值导出」强制检查
+// 规则：叶子实现文件只导出一个自实现的公共值符号（function/const/class）；
+// 该符号直接消费的伴生类型（Options/Adjuster/Context 等）可与之处在同一文件。
+// 豁免：barrel（含 re-export 的 index.ts）、纯类型文件（types.ts）、
+//       _internal/、experimental/、helpers/、constant(s).ts、第三方 re-export、重载。
+// ----------------------------------------------------------------------------
+
+/**
+ * 统计一个文件中「直接声明的公共值符号」数量与名称。
+ * 只统计 function/const/let/var/class（值符号），排除 interface/type（类型符号）。
+ * re-export（export { x } from './y'）不计入——那不是本文件实现。
+ * 函数重载（同一符号多个签名）合并为 1 个。
+ * @returns {{ count: number, names: string[] }} 值符号数量与排序后的名称列表
+ */
+function countLocalValueDeclarations(sourceFilePath) {
+  const program = ts.createProgram([sourceFilePath], OPTIONS, HOST)
+  const sourceFile = program.getSourceFile(sourceFilePath)
+  if (!sourceFile)
+    return { count: 0, names: [] }
+
+  const valueNames = new Set() // Set 自动合并重载（同名函数多签名）
+
+  for (const stmt of sourceFile.statements) {
+    const modifiers = ts.canHaveModifiers(stmt) ? ts.getModifiers(stmt) : undefined
+    const hasExport = modifiers?.some(m => m.kind === ts.SyntaxKind.ExportKeyword)
+    if (!hasExport)
+      continue
+
+    // function / class —— 值符号（重载签名也在此，靠 Set 合并）
+    if (ts.isFunctionDeclaration(stmt) || ts.isClassDeclaration(stmt)) {
+      const name = stmt.name?.getText()
+      if (name)
+        valueNames.add(name)
+      continue
+    }
+    // interface / type alias —— 类型符号，不计入
+    if (ts.isInterfaceDeclaration(stmt) || ts.isTypeAliasDeclaration(stmt))
+      continue
+    // const/let/var —— 值符号
+    if (ts.isVariableStatement(stmt)) {
+      for (const decl of stmt.declarationList.declarations) {
+        const declName = decl.name.getText()
+        if (declName)
+          valueNames.add(declName)
+      }
+      continue
+    }
+    // ExportDeclaration（含 re-export）—— 不计入「本文件实现」
+  }
+
+  const names = [...valueNames].sort()
+  return { count: names.length, names }
+}
+
+/**
+ * 递归收集一个包 src 目录下所有「叶子实现文件」。
+ * 跳过：barrel（含 re-export 的 index.ts）、纯类型文件、_internal/、experimental/、
+ *       helpers.ts、constant(s).ts、test 文件、.d.ts。
+ */
+function collectLeafImplFiles(srcDir, pkgName, results = [], relDir = '') {
+  if (!existsSync(srcDir))
+    return results
+
+  for (const entry of readdirSync(srcDir, { withFileTypes: true })) {
+    const fullPath = join(srcDir, entry.name)
+    if (entry.isDirectory()) {
+      // 跳过 _internal / experimental / node_modules
+      if (entry.name === '_internal' || entry.name === 'experimental' || entry.name === 'node_modules')
+        continue
+      collectLeafImplFiles(fullPath, pkgName, results, relDir ? `${relDir}/${entry.name}` : entry.name)
+    }
+    else if (entry.isFile() && (entry.name.endsWith('.ts') || entry.name.endsWith('.mts')) && !entry.name.endsWith('.d.ts')) {
+      const base = entry.name.replace(/\.(ts|mts)$/, '')
+      // 跳过 test 文件、.d.ts
+      if (base.endsWith('.test') || base.endsWith('.spec'))
+        continue
+      // 跳过纯类型文件、内部辅助文件、常量文件
+      if (base === 'types' || base === 'helpers' || base === 'constant' || base === 'constants')
+        continue
+      // index.ts：若它是 barrel（含 re-export）则跳过；若是纯实现则保留
+      if (base === 'index') {
+        const { stars, explicit } = parseFile(fullPath)
+        const hasReExport = stars.length > 0
+          || [...explicit.values()].some(info => info.origin !== 'local')
+        if (hasReExport)
+          continue // barrel，跳过
+      }
+      results.push({ file: fullPath, pkgName })
+    }
+  }
+  return results
+}
+
+/**
+ * 检测全仓所有叶子实现文件的「多公共值导出」违规。
+ * @param {Array} surfaces - analyzeAll() 的结果（用于获取包列表）
+ * @returns {Array<{ package: string, file: string, count: number, names: string[] }>} 违规列表
+ */
+function detectMultiValueExports(surfaces) {
+  const violations = []
+  const seenPackages = new Set()
+
+  for (const surface of surfaces) {
+    if (seenPackages.has(surface.package))
+      continue
+    seenPackages.add(surface.package)
+
+    const pkgDirName = surface.package.replace(/^@[^/]+\//, '')
+    const pkgDir = join(PACKAGES_DIR, pkgDirName)
+    const srcDir = join(pkgDir, 'src')
+    if (!existsSync(srcDir))
+      continue
+
+    const leafFiles = collectLeafImplFiles(srcDir, surface.package)
+    for (const { file } of leafFiles) {
+      const { count, names } = countLocalValueDeclarations(file)
+      if (count >= 2) {
+        violations.push({
+          package: surface.package,
+          file: relPath(file),
+          count,
+          names,
+        })
+      }
+    }
+  }
+
+  return violations
+}
+
 /**
  * 将 surface 的 symbols Map 序列化为可读结构（供 JSON 打印）。
  */
@@ -438,20 +569,26 @@ function printSurfaceJSON(surfaces) {
 
 /**
  * --audit 模式：检测全部冲突，打印人类可读报告，有冲突非零退出。
+ * 两类检查：
+ *   1. star-export 符号冲突（AMBIGUOUS / OVERRIDE）
+ *   2. 叶子实现文件多公共值导出（违反「一文件一公共值导出」规则）
  */
 function runAudit(surfaces) {
   const allConflicts = []
   for (const surface of surfaces)
     allConflicts.push(...detectConflicts(surface))
 
-  const entryCount = surfaces.length
+  const multiValueViolations = detectMultiValueExports(surfaces)
 
-  if (allConflicts.length === 0) {
+  const entryCount = surfaces.length
+  const totalIssues = allConflicts.length + multiValueViolations.length
+
+  if (totalIssues === 0) {
     console.log(`Export audit passed: 0 conflicts across ${entryCount} entries`)
     return 0
   }
 
-  // 按包分组打印
+  // 按包分组打印冲突
   const grouped = new Map()
   for (const conflict of allConflicts) {
     const key = conflict.package
@@ -460,23 +597,37 @@ function runAudit(surfaces) {
     grouped.get(key).push(conflict)
   }
 
-  console.log(`Export audit FAILED: ${allConflicts.length} conflict(s) across ${entryCount} entries\n`)
-  for (const [pkgName, conflicts] of grouped) {
-    console.log(`  ${pkgName}`)
-    for (const c of conflicts) {
-      const pkgDir = pkgName.replace(/^@[^/]+\//, '')
-      if (c.type === 'AMBIGUOUS') {
-        console.log(
-          `    packages/${pkgDir} (${c.entry}): AMBIGUOUS '${c.symbol}' (${c.sources.join(' ⊕ ')})`,
-        )
-      }
-      else {
-        console.log(
-          `    packages/${pkgDir} (${c.entry}): OVERRIDE '${c.symbol}' (explicit shadows ${c.sources.join(', ')})`,
-        )
+  console.log(`Export audit FAILED: ${totalIssues} issue(s) across ${entryCount} entries\n`)
+
+  if (allConflicts.length > 0) {
+    console.log(`  star-export 冲突 (${allConflicts.length}):`)
+    for (const [pkgName, conflicts] of grouped) {
+      console.log(`  ${pkgName}`)
+      for (const c of conflicts) {
+        const pkgDir = pkgName.replace(/^@[^/]+\//, '')
+        if (c.type === 'AMBIGUOUS') {
+          console.log(
+            `    packages/${pkgDir} (${c.entry}): AMBIGUOUS '${c.symbol}' (${c.sources.join(' ⊕ ')})`,
+          )
+        }
+        else {
+          console.log(
+            `    packages/${pkgDir} (${c.entry}): OVERRIDE '${c.symbol}' (explicit shadows ${c.sources.join(', ')})`,
+          )
+        }
       }
     }
   }
+
+  if (multiValueViolations.length > 0) {
+    console.log(`\n  多公共值导出违规 (${multiValueViolations.length}) —— 每个叶子实现文件只应导出一个自实现的公共值符号:`)
+    for (const v of multiValueViolations) {
+      console.log(
+        `    ${v.file}: 导出 ${v.count} 个值符号 [${v.names.join(', ')}] —— 请拆分为每文件一个`,
+      )
+    }
+  }
+
   return 1
 }
 
@@ -498,9 +649,11 @@ function toKebab(name) {
   let n = name
   if (n.startsWith('_unstable_'))
     n = n.slice('_unstable_'.length)
+  // 剥离前导下划线后再判断（如 _JSON → JSON）
+  const leading = n.startsWith('_') ? n.slice(1) : n
   // UPPER_SNAKE（全大写 + 下划线）→ 整体小写后下划线转连字符
-  if (/^[A-Z][A-Z0-9_]*$/.test(n))
-    return n.toLowerCase().replace(/_/g, '-')
+  if (/^[A-Z][A-Z0-9_]*$/.test(leading))
+    return leading.toLowerCase().replace(/_/g, '-')
   // PascalCase / camelCase：在大小写边界插入连字符
   return n
     .replace(/([a-z0-9])([A-Z])/g, '$1-$2')
@@ -536,6 +689,58 @@ function buildDocsFileset(rootDir) {
 
   walk(docsDir)
   return fileset
+}
+
+/**
+ * 判断一个源文件是否直接声明（实现）了给定符号。
+ * 直接声明 = 文件内有 `export function/const/class X` 或 `export { X }`（本地，无 from）。
+ * 不含 named re-export（`export { X } from './y'`）——那是转手，不是定义。
+ * @returns {boolean} 文件是否直接声明了该符号
+ */
+function declaresSymbolLocally(sourceFilePath, symbol) {
+  const { explicit } = parseFile(sourceFilePath)
+  const info = explicit.get(symbol)
+  // origin === 'local' 表示该文件自身声明了该符号（见 parseFile 行 159-164、189-195）
+  return info?.origin === 'local'
+}
+
+/**
+ * 沿 named re-export 链追溯符号的「定义文件」。
+ *
+ * 背景：commit 切换为显式 barrel 后，named re-export（`export { safe } from './function'`）
+ * 把 originFile 记成了执行 re-export 的 barrel 文件，而非符号定义文件，导致 deriveDocUrl
+ * 推导出缺前缀的文档路径（如 reference/safe 而非 reference/function/safe）而查不到。
+ *
+ * 本函数从起始文件出发，若该文件直接声明了符号就返回它；否则查找该文件中对该符号的
+ * named re-export（`export { symbol } from './x'`），递归到 './x' 继续追溯，直到命中定义
+ * 文件或链路终止（返回起始文件作为兜底，保持旧行为）。
+ *
+ * @param {string} symbol - 符号名
+ * @param {string} startFile - 起始文件绝对路径（通常是 surface 记录的 originFile = barrel）
+ * @param {Set<string>} [visited] - 防环
+ * @returns {string} 符号定义文件的绝对路径
+ */
+function resolveDefinitionFile(symbol, startFile, visited = new Set()) {
+  if (visited.has(startFile))
+    return startFile
+  visited.add(startFile)
+
+  if (declaresSymbolLocally(startFile, symbol))
+    return startFile
+
+  // 查找该文件中对该符号的 named re-export，拿到目标 specifier
+  const { explicit } = parseFile(startFile)
+  const info = explicit.get(symbol)
+  if (info && info.origin !== 'local' && (info.origin.startsWith('./') || info.origin.startsWith('../'))) {
+    const { resolvedModule } = ts.resolveModuleName(info.origin, startFile, OPTIONS, HOST)
+    if (resolvedModule) {
+      const nextFile = resolvedModule.resolvedFileName
+      if (isLocalSource(nextFile))
+        return resolveDefinitionFile(symbol, nextFile, visited)
+    }
+  }
+
+  return startFile
 }
 
 /**
@@ -756,8 +961,10 @@ function runDocs(surfaces) {
         }
         const origin = info.origin
         if (origin === 'local' || origin.startsWith('./') || origin.startsWith('../')) {
-          // 本地 API：用 originFile 推导 URL
-          const url = deriveDocUrl(symbol, info.originFile, pkgDirName, docsFileset)
+          // 本地 API：沿 named re-export 链追溯到定义文件，再推导文档 URL
+          // （originFile 可能是 barrel 而非定义文件，需溯源才能得到正确的 reference/<cat>/<fn> 路径）
+          const defFile = resolveDefinitionFile(symbol, info.originFile)
+          const url = deriveDocUrl(symbol, defFile, pkgDirName, docsFileset)
           if (!localApiSet.has(symbol))
             localApiSet.set(symbol, url)
         }
@@ -850,9 +1057,12 @@ export {
   buildCompilerOptions,
   buildDocsFileset,
   collectLocalExports,
+  countLocalValueDeclarations,
+  declaresSymbolLocally,
   deriveDocUrl,
   deriveOverviewUrl,
   detectConflicts,
+  detectMultiValueExports,
   discoverPackages,
   entryToSourceFile,
   expandStars,
@@ -864,6 +1074,7 @@ export {
   parseFile,
   printSurfaceJSON,
   renderLlmsMarkdown,
+  resolveDefinitionFile,
   runAudit,
   runDocs,
   serializeSurface,
