@@ -45,7 +45,7 @@
   },
   "main": "./dist/index.mjs",
   "module": "./dist/index.mjs",
-  "browser": "./dist/esdora-kit.min.js",
+  "browser": "./dist/esdora-kit.min.iife.js",
   "types": "./dist/index.d.mts",
   "files": [
     "dist",
