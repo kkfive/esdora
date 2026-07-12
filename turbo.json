@@ -36,6 +36,10 @@
     "docs:llms": {
       "dependsOn": ["^build"],
       "outputs": ["packages/*/llms.md", "llms.txt"]
+    },
+    "lint:packages": {
+      "outputs": [],
+      "dependsOn": ["^build"]
     }
   }
 }

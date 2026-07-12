@@ -17,6 +17,7 @@
     "lint:skills": "node .agents/skills/esdora/scripts/check-skill-architecture.mjs",
     "lint:skill-graph": "node .agents/skills/esdora/scripts/trace-skill-loading.mjs",
     "lint:exports": "node scripts/analyze-package-exports.mjs --audit",
+    "lint:packages": "node scripts/lint-packages.mjs",
     "docs": "pnpm -C docs run docs:dev",
     "docs:build": "pnpm -C docs run docs:build",
     "docs:preview": "pnpm -C docs run docs:preview",
@@ -39,6 +40,7 @@
   },
   "devDependencies": {
     "@antfu/eslint-config": "catalog:",
+    "@arethetypeswrong/cli": "catalog:",
     "@changesets/changelog-github": "catalog:",
     "@changesets/cli": "catalog:",
     "@commitlint/cli": "catalog:",
@@ -53,6 +55,7 @@
     "eslint-plugin-format": "catalog:",
     "lefthook": "catalog:",
     "pnpm": "catalog:",
+    "publint": "catalog:",
     "tinyexec": "catalog:",
     "tsdown": "catalog:",
     "tsx": "catalog:",
